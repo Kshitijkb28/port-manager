@@ -24,6 +24,7 @@ if '%errorlevel%' NEQ '0' (
 
 echo ============================================
 echo  Port Manager - Running as Administrator
+echo  Mode: WebSocket (Real-time Updates)
 echo ============================================
 echo.
 
@@ -33,6 +34,11 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5000 ^| findstr LISTENING') 
     taskkill /F /PID %%a >nul 2>&1
 )
 
+:: Install dependencies if needed
+echo Checking dependencies...
+pip install flask flask-cors psutil flask-socketio eventlet -q
+
+echo.
 echo Starting Port Manager...
 echo URL: http://localhost:5000
 echo.

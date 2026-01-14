@@ -279,6 +279,39 @@ header {
     box-shadow: 0 0 15px var(--danger-glow);
 }
 
+.btn-kill-tree {
+    background: transparent;
+    color: var(--warning);
+    border: 1px solid var(--warning);
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+.btn-kill-tree:hover {
+    background: var(--warning);
+    color: white;
+    box-shadow: 0 0 15px var(--warning-glow);
+}
+
+/* Parent process indicator */
+.parent-indicator {
+    display: inline-block;
+    margin-left: 6px;
+    color: var(--warning);
+    font-size: 14px;
+    cursor: help;
+    opacity: 0.8;
+}
+
+.parent-indicator:hover {
+    opacity: 1;
+}
+
+/* Action cell */
+.action-cell {
+    white-space: nowrap;
+}
+
 .btn-collapse {
     background: transparent;
     color: var(--text-secondary);

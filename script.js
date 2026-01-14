@@ -1,17 +1,15 @@
 /**
  * Port Manager - Frontend JavaScript
- * Real-time process monitoring and management
+ * Real-time process monitoring using WebSockets
  */
 
 const API_BASE = '';
-const REFRESH_INTERVAL = 2000; // 2 seconds
-
-let autoRefreshEnabled = true;
-let refreshIntervalId = null;
-let previousPorts = { user: new Set(), system: new Set() };
+let socket = null;
+let isConnected = false;
 let pendingKillPid = null;
 let currentFilter = 'all';
 let allProcessData = { user: [], system: [] };
+let previousPorts = { user: new Set(), system: new Set() };
 
 // App type display names
 const APP_TYPE_LABELS = {
@@ -103,11 +101,82 @@ function init() {
         }
     });
 
-    // Initial fetch
-    fetchPorts();
+    // Initialize WebSocket connection
+    initWebSocket();
+}
 
-    // Start auto-refresh
-    startAutoRefresh();
+/**
+ * Initialize WebSocket connection
+ */
+function initWebSocket() {
+    socket = io({
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000
+    });
+
+    // Connection established
+    socket.on('connect', () => {
+        console.log('WebSocket connected');
+        isConnected = true;
+        updateConnectionStatus(true);
+        showToast('Connected to server', 'success');
+    });
+
+    // Connection lost
+    socket.on('disconnect', () => {
+        console.log('WebSocket disconnected');
+        isConnected = false;
+        updateConnectionStatus(false);
+        showToast('Disconnected from server', 'error');
+    });
+
+    // Receive port updates
+    socket.on('ports_update', (data) => {
+        if (data.success) {
+            allProcessData = data.data;
+            renderProcesses(data.data);
+            updateStats(data.counts);
+            updateAdminBadge(data.is_admin);
+            updateLastUpdate();
+        }
+    });
+
+    // Handle errors
+    socket.on('error', (data) => {
+        console.error('WebSocket error:', data);
+        showToast(data.message || 'Connection error', 'error');
+    });
+
+    // Reconnection attempt
+    socket.on('reconnect_attempt', (attemptNumber) => {
+        console.log(`Reconnection attempt ${attemptNumber}`);
+    });
+
+    // Reconnected
+    socket.on('reconnect', () => {
+        console.log('Reconnected to server');
+        showToast('Reconnected to server', 'success');
+    });
+}
+
+/**
+ * Update connection status indicator
+ */
+function updateConnectionStatus(connected) {
+    // Update the auto-refresh toggle label to show connection status
+    const autoRefreshLabel = document.querySelector('.auto-refresh-toggle span');
+    if (autoRefreshLabel) {
+        if (connected) {
+            autoRefreshLabel.textContent = 'Live';
+            autoRefreshLabel.style.color = '#10b981';
+        } else {
+            autoRefreshLabel.textContent = 'Offline';
+            autoRefreshLabel.style.color = '#ef4444';
+        }
+    }
 }
 
 /**
@@ -151,7 +220,7 @@ function renderFilteredProcesses() {
 }
 
 /**
- * Fetch port data from API
+ * Fetch port data from API (fallback)
  */
 async function fetchPorts() {
     try {
@@ -212,24 +281,39 @@ function renderProcessRows(processes, previousSet, newSet) {
         const isNew = newSet.size > 0 && !previousSet.has(key);
         const appType = proc.app_type || 'other';
         const appLabel = APP_TYPE_LABELS[appType] || appType;
+        const hasParent = proc.has_parent_controller;
+        const parentInfo = hasParent ? `Parent: ${proc.parent_name} (${proc.parent_pid})` : '';
 
         return `
             <tr class="${isNew ? 'new-entry' : ''}" data-pid="${proc.pid}" data-app="${appType}">
                 <td class="port-cell">${proc.port}</td>
                 <td class="pid-cell">${proc.pid}</td>
-                <td class="process-name">${escapeHtml(proc.name)}</td>
+                <td class="process-name">
+                    ${escapeHtml(proc.name)}
+                    ${hasParent ? `<span class="parent-indicator" title="${parentInfo}">&#8635;</span>` : ''}
+                </td>
                 <td><span class="app-badge ${appType}">${appLabel}</span></td>
                 <td class="address-cell">${proc.address}</td>
                 <td><span class="type-badge ${proc.type.toLowerCase()}">${proc.type}</span></td>
                 <td>${getStatusBadge(proc.conn_status, proc.status)}</td>
-                <td>
-                    <button class="btn btn-kill" onclick="handleKill(${proc.pid}, '${escapeHtml(proc.name)}', ${proc.port})">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
-                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                        Kill
-                    </button>
+                <td class="action-cell">
+                    ${hasParent ? `
+                        <button class="btn btn-kill-tree" onclick="handleKillTree(${proc.pid}, '${escapeHtml(proc.name)}', ${proc.port}, '${escapeHtml(proc.parent_name || '')}', ${proc.parent_pid || 0})" title="Kill process and parent">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                <path d="M18 6L6 18M6 6l12 12"></path>
+                                <circle cx="12" cy="12" r="10"></circle>
+                            </svg>
+                            Kill Tree
+                        </button>
+                    ` : `
+                        <button class="btn btn-kill" onclick="handleKill(${proc.pid}, '${escapeHtml(proc.name)}', ${proc.port})">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                            Kill
+                        </button>
+                    `}
                 </td>
             </tr>
         `;
@@ -291,42 +375,37 @@ function updateLastUpdate() {
  */
 function handleRefresh() {
     elements.refreshBtn.classList.add('spinning');
-    fetchPorts().finally(() => {
+
+    if (isConnected && socket) {
+        // Request refresh via WebSocket
+        socket.emit('request_refresh');
         setTimeout(() => {
             elements.refreshBtn.classList.remove('spinning');
         }, 500);
-    });
+    } else {
+        // Fallback to REST API
+        fetchPorts().finally(() => {
+            setTimeout(() => {
+                elements.refreshBtn.classList.remove('spinning');
+            }, 500);
+        });
+    }
 }
 
 /**
- * Handle auto-refresh toggle
+ * Handle auto-refresh toggle (now controls WebSocket connection)
  */
 function handleAutoRefreshToggle() {
-    autoRefreshEnabled = elements.autoRefresh.checked;
-    if (autoRefreshEnabled) {
-        startAutoRefresh();
+    const enabled = elements.autoRefresh.checked;
+
+    if (enabled) {
+        if (!isConnected && socket) {
+            socket.connect();
+        }
     } else {
-        stopAutoRefresh();
-    }
-}
-
-/**
- * Start auto-refresh
- */
-function startAutoRefresh() {
-    if (refreshIntervalId) {
-        clearInterval(refreshIntervalId);
-    }
-    refreshIntervalId = setInterval(fetchPorts, REFRESH_INTERVAL);
-}
-
-/**
- * Stop auto-refresh
- */
-function stopAutoRefresh() {
-    if (refreshIntervalId) {
-        clearInterval(refreshIntervalId);
-        refreshIntervalId = null;
+        if (isConnected && socket) {
+            socket.disconnect();
+        }
     }
 }
 
@@ -349,6 +428,43 @@ function handleKill(pid, name, port) {
         <div><strong>Port:</strong> ${port}</div>
     `;
     showModal();
+}
+
+/**
+ * Handle kill tree button click - kill process and its parent
+ */
+async function handleKillTree(pid, name, port, parentName, parentPid) {
+    // Find and animate the row
+    const rows = document.querySelectorAll(`tr[data-pid="${pid}"]`);
+    rows.forEach(row => {
+        row.classList.add('killing');
+    });
+
+    try {
+        const response = await fetch(`${API_BASE}/api/kill-tree/${pid}`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            showToast(data.message, 'success');
+            // Remove the rows immediately after animation
+            setTimeout(() => {
+                rows.forEach(row => row.remove());
+            }, 300);
+        } else {
+            showToast(data.error, 'error');
+            rows.forEach(row => {
+                row.classList.remove('killing');
+            });
+        }
+    } catch (error) {
+        console.error('Error killing process tree:', error);
+        showToast('Failed to kill process tree', 'error');
+        rows.forEach(row => {
+            row.classList.remove('killing');
+        });
+    }
 }
 
 /**
@@ -377,8 +493,6 @@ async function handleConfirmKill() {
             // Remove the rows immediately after animation
             setTimeout(() => {
                 rows.forEach(row => row.remove());
-                // Then refresh to get updated list
-                fetchPorts();
             }, 300);
         } else {
             showToast(data.error, 'error');

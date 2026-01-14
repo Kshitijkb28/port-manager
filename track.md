@@ -5,27 +5,31 @@ A web-based GUI application to monitor and manage all processes running on netwo
 
 ## Features
 - Display all processes using network ports
+- **WebSocket Real-time Updates** - Server pushes updates only when changes occur
+- **Kill Tree Feature** - Kills process AND its parent controller to prevent respawn
+- **Parent Process Detection** - Shows indicator when process has a controller parent
 - **App Type Detection** - Identifies Node.js, React, Next.js, Python, Flask, PHP, MySQL, etc.
 - **Filter by App Type** - Filter buttons to show only specific frameworks
 - Kill process functionality (using Windows taskkill)
-- Real-time auto-refresh (every 2 seconds)
-- Manual refresh button
+- Connection status indicator (Live/Offline)
+- Manual refresh button (fallback)
 - Separate sections for System and User processes
 - Modern dark theme UI with dark scrollbars
 
 ## Tech Stack
-- **Backend**: Python Flask with psutil
-- **Frontend**: HTML, CSS, JavaScript
+- **Backend**: Python Flask with Flask-SocketIO and eventlet
+- **Frontend**: HTML, CSS, JavaScript with Socket.IO client
 - **Port**: 5000
+- **Protocol**: WebSocket (with HTTP fallback)
 
 ## Files
-- `app.py` - Flask backend server with app type detection
+- `app.py` - Flask backend with WebSocket + Kill Tree API
 - `index.html` - Main HTML structure with filter bar
-- `styles.css` - Dark theme styling with filter buttons and app badges
-- `script.js` - Frontend logic with filter functionality
-- `requirements.txt` - Python dependencies
+- `styles.css` - Dark theme styling with Kill Tree button styles
+- `script.js` - Frontend logic with WebSocket + handleKillTree
+- `requirements.txt` - Python dependencies (flask-socketio, eventlet)
 - `start.bat` - Windows startup script
-- `PortManager.bat` - Local startup script
+- `PortManager.bat` - Local startup script with dependency installation
 - `C:\Users\kshit\Desktop\Port Manager.lnk` - Desktop shortcut with icon
 
 ## How to Run
@@ -42,12 +46,20 @@ A web-based GUI application to monitor and manage all processes running on netwo
 - Nginx, Apache
 - Browser processes
 
-## Bug Fixes (2026-01-10)
-- Fixed scrollbar styling (dark theme)
-- Fixed kill functionality using Windows taskkill /F
-- Fixed empty rows issue after killing
-- Added desktop admin shortcut with icon
-- Added app type filter feature
+## Kill Tree Feature (2026-01-14)
+- **Problem**: When killing PHP/Node processes, parent `artisan serve` restarts them
+- **Solution**: Added "Kill Tree" button that kills BOTH child and parent process
+- Detects parent controller processes (php.exe, node.exe, python.exe, etc.)
+- Shows orange recycle icon (↻) next to process name when parent detected
+- Orange "Kill Tree" button appears instead of red "Kill" button
+- Uses `/api/kill-tree/<pid>` endpoint with `/T` flag for tree kill
+
+## WebSocket Implementation (2026-01-14)
+- Replaced 2-second polling with WebSocket connection
+- Server monitors ports every 2 seconds in background
+- Only pushes updates when process list changes (uses MD5 hash comparison)
+- Connection status shown in UI (Live/Offline)
+- Fallback to REST API if WebSocket fails
 
 ## Status
 - [x] Backend API created
@@ -60,6 +72,8 @@ A web-based GUI application to monitor and manage all processes running on netwo
 - [x] App type detection added
 - [x] Filter by app type added
 - [x] Desktop GUI created (port_manager_gui.py)
+- [x] WebSocket implementation (no more polling)
+- [x] Kill Tree feature (kills parent + child)
 
 ## Last Updated
-2026-01-10 22:50
+2026-01-14 11:30

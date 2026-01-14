@@ -1,16 +1,24 @@
 """
-Port Manager - Flask Backend
+Port Manager - Flask Backend with WebSocket Support
 Monitors all processes running on network ports and provides kill functionality.
+Uses WebSockets for real-time updates instead of polling.
 """
 
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 import psutil
 import os
 import ctypes
+import json
+import hashlib
 
 app = Flask(__name__, static_folder='.')
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# Store previous state to detect changes
+previous_state_hash = None
 
 # System process names (common Windows system processes)
 SYSTEM_PROCESSES = {
@@ -135,12 +143,45 @@ def get_port_processes():
             
             try:
                 proc = psutil.Process(pid)
-                proc_info = proc.as_dict(attrs=['name', 'username', 'status', 'create_time', 'cmdline'])
+                proc_info = proc.as_dict(attrs=['name', 'username', 'status', 'create_time', 'cmdline', 'ppid'])
                 cmdline = ' '.join(proc_info.get('cmdline', []) or [])
                 proc_name = proc_info.get('name', 'Unknown')
                 
                 # Detect app type
                 app_type = detect_app_type(proc_name, cmdline)
+                
+                # Get root controller by tracing up the parent chain
+                controller_names = ['php.exe', 'node.exe', 'python.exe', 'java.exe', 'ruby.exe']
+                wrapper_names = ['cmd.exe', 'powershell.exe', 'conhost.exe']
+                
+                parent_pid = proc_info.get('ppid', None)
+                root_controller_pid = None
+                root_controller_name = None
+                has_parent_controller = False
+                
+                # Trace up the parent chain
+                current_pid = parent_pid
+                visited = set()
+                while current_pid and current_pid > 0 and current_pid not in visited:
+                    visited.add(current_pid)
+                    try:
+                        parent_proc = psutil.Process(current_pid)
+                        parent_name = parent_proc.name().lower()
+                        parent_ppid = parent_proc.ppid()
+                        
+                        if parent_name in controller_names:
+                            # Found a controller, this is the root (or check further)
+                            root_controller_pid = current_pid
+                            root_controller_name = parent_proc.name()
+                            has_parent_controller = True
+                        
+                        # Keep going up if parent is a wrapper or controller
+                        if parent_name in wrapper_names or parent_name in controller_names:
+                            current_pid = parent_ppid
+                            continue
+                        break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        break
                 
                 process_data = {
                     'port': port,
@@ -151,7 +192,10 @@ def get_port_processes():
                     'address': f"{conn.laddr.ip}:{conn.laddr.port}",
                     'type': 'TCP' if conn.type == 1 else 'UDP',
                     'conn_status': conn.status if hasattr(conn, 'status') else 'N/A',
-                    'app_type': app_type
+                    'app_type': app_type,
+                    'parent_pid': root_controller_pid or parent_pid,
+                    'parent_name': root_controller_name,
+                    'has_parent_controller': has_parent_controller
                 }
                 
                 if is_system_process(proc_name, proc_info.get('username', '')):
@@ -168,6 +212,38 @@ def get_port_processes():
     
     return processes
 
+def get_state_hash(processes):
+    """Generate a hash of the current process state to detect changes."""
+    # Create a consistent string representation
+    state_str = json.dumps(processes, sort_keys=True)
+    return hashlib.md5(state_str.encode()).hexdigest()
+
+def background_monitor():
+    """Background task to monitor port changes and emit updates."""
+    global previous_state_hash
+    
+    while True:
+        socketio.sleep(2)  # Check every 2 seconds
+        
+        try:
+            processes = get_port_processes()
+            current_hash = get_state_hash(processes)
+            
+            # Only emit if state has changed
+            if current_hash != previous_state_hash:
+                previous_state_hash = current_hash
+                socketio.emit('ports_update', {
+                    'success': True,
+                    'data': processes,
+                    'is_admin': is_admin(),
+                    'counts': {
+                        'system': len(processes['system']),
+                        'user': len(processes['user'])
+                    }
+                })
+        except Exception as e:
+            print(f"Background monitor error: {e}")
+
 @app.route('/')
 def index():
     """Serve the main HTML page."""
@@ -180,9 +256,13 @@ def static_files(filename):
 
 @app.route('/api/ports')
 def get_ports():
-    """API endpoint to get all port processes."""
+    """API endpoint to get all port processes (fallback for initial load)."""
+    global previous_state_hash
+    
     try:
         processes = get_port_processes()
+        previous_state_hash = get_state_hash(processes)
+        
         return jsonify({
             'success': True,
             'data': processes,
@@ -242,12 +322,171 @@ def kill_process(pid):
             'error': str(e)
         }), 500
 
+@app.route('/api/kill-tree/<int:pid>', methods=['POST'])
+def kill_process_tree(pid):
+    """API endpoint to kill a process and its root controller (to prevent respawn)."""
+    import subprocess
+    killed_processes = []
+    
+    def find_root_controller(start_pid):
+        """Trace up the parent chain to find the root controller process."""
+        controller_names = ['php.exe', 'node.exe', 'python.exe', 'java.exe', 'ruby.exe']
+        wrapper_names = ['cmd.exe', 'powershell.exe', 'conhost.exe']
+        
+        current_pid = start_pid
+        root_controller = None
+        visited = set()
+        
+        while current_pid and current_pid > 0 and current_pid not in visited:
+            visited.add(current_pid)
+            try:
+                proc = psutil.Process(current_pid)
+                proc_name = proc.name().lower()
+                parent_pid = proc.ppid()
+                
+                # If this is a controller (not a wrapper), remember it as potential root
+                if proc_name in controller_names:
+                    root_controller = (current_pid, proc.name())
+                
+                # If parent is a shell/wrapper, keep going up
+                if parent_pid and parent_pid > 0:
+                    try:
+                        parent_proc = psutil.Process(parent_pid)
+                        parent_name = parent_proc.name().lower()
+                        
+                        # If parent is a controller, it might be the real root
+                        if parent_name in controller_names:
+                            root_controller = (parent_pid, parent_proc.name())
+                        
+                        # Keep going up if parent is a wrapper or controller
+                        if parent_name in wrapper_names or parent_name in controller_names:
+                            current_pid = parent_pid
+                            continue
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                
+                break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                break
+        
+        return root_controller
+    
+    try:
+        proc = psutil.Process(pid)
+        proc_name = proc.name()
+        
+        # Find the root controller in the parent chain
+        root_controller = find_root_controller(pid)
+        
+        if root_controller:
+            root_pid, root_name = root_controller
+            # Kill the root controller with /T to kill all children
+            result = subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(root_pid)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                killed_processes.append(f'{root_name} (PID: {root_pid}) + children')
+            else:
+                # Fallback: kill just the target process
+                result = subprocess.run(
+                    ['taskkill', '/F', '/PID', str(pid)],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    killed_processes.append(f'{proc_name} (PID: {pid})')
+        else:
+            # No controller found, just kill the process
+            result = subprocess.run(
+                ['taskkill', '/F', '/PID', str(pid)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                killed_processes.append(f'{proc_name} (PID: {pid})')
+        
+        if killed_processes:
+            return jsonify({
+                'success': True,
+                'message': f'Killed: {", ".join(killed_processes)}'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to kill process'
+            }), 500
+            
+    except psutil.NoSuchProcess:
+        return jsonify({
+            'success': False,
+            'error': f'Process with PID {pid} not found'
+        }), 404
+    except psutil.AccessDenied:
+        return jsonify({
+            'success': False,
+            'error': f'Access denied. Run as Administrator to kill this process.'
+        }), 403
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# WebSocket event handlers
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection."""
+    print("Client connected")
+    # Send initial data immediately
+    try:
+        processes = get_port_processes()
+        emit('ports_update', {
+            'success': True,
+            'data': processes,
+            'is_admin': is_admin(),
+            'counts': {
+                'system': len(processes['system']),
+                'user': len(processes['user'])
+            }
+        })
+    except Exception as e:
+        print(f"Error sending initial data: {e}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection."""
+    print("Client disconnected")
+
+@socketio.on('request_refresh')
+def handle_refresh_request():
+    """Handle manual refresh request from client."""
+    try:
+        processes = get_port_processes()
+        emit('ports_update', {
+            'success': True,
+            'data': processes,
+            'is_admin': is_admin(),
+            'counts': {
+                'system': len(processes['system']),
+                'user': len(processes['user'])
+            }
+        })
+    except Exception as e:
+        emit('error', {'message': str(e)})
+
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("  PORT MANAGER - Process Monitor")
+    print("  PORT MANAGER - Process Monitor (WebSocket Mode)")
     print("="*60)
     print(f"  Admin Mode: {'Yes' if is_admin() else 'No (Run as Admin for full access)'}")
     print("  URL: http://localhost:5000")
+    print("  Mode: WebSocket (real-time updates)")
     print("="*60 + "\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # Start background monitor
+    socketio.start_background_task(background_monitor)
+    
+    # Run with eventlet
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
